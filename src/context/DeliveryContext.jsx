@@ -1,5 +1,6 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { isTimestampInDateRange } from '../utils/dateUtils';
+import { Peer } from 'peerjs';
 
 const DeliveryContext = createContext();
 
@@ -9,27 +10,9 @@ const STORAGE_KEYS = {
   AUTH: 'delivery_tracker_auth_v2',
 };
 
-const DEFAULT_CLOUD_URL = 'https://crudcrud.com/api/9beef4ec13c24a76811b1bcfa1a64245/orders';
 const DEFAULT_RIDERS = ['yowas', 'onesphore', 'paul', 'fred', 'uzziah', 'valens'];
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-// Self-healing Cloud Endpoint URL Generator
-async function fetchActiveCloudUrl() {
-  try {
-    const saved = localStorage.getItem('delivery_crudcrud_url');
-    if (saved) return saved;
-
-    const res = await fetch('https://crudcrud.com');
-    const html = await res.text();
-    const match = html.match(/https:\/\/crudcrud\.com\/api\/[a-f0-9]{32}/);
-    if (match) {
-      const freshUrl = `${match[0]}/orders`;
-      localStorage.setItem('delivery_crudcrud_url', freshUrl);
-      return freshUrl;
-    }
-  } catch (err) {}
-  return DEFAULT_CLOUD_URL;
-}
+const HOST_PEER_ID = 'delivery-tracker-admin-host-2026';
 
 // Helper to sanitize order objects against corrupt/partial JSON
 function sanitizeOrder(raw) {
@@ -121,140 +104,75 @@ export function DeliveryProvider({ children }) {
     return [];
   });
 
-  // --- Push Single Order / Status to Cloud Database ---
-  const syncOrderToCloud = useCallback(async (orderObj) => {
-    if (!orderObj) return;
-    try {
-      let apiUrl = localStorage.getItem('delivery_crudcrud_url') || DEFAULT_CLOUD_URL;
-      let res = await fetch(apiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(orderObj),
-      });
+  // --- PeerJS WebRTC P2P Connections ---
+  const peerConnectionsRef = useRef([]);
 
-      if (!res.ok) {
-        localStorage.removeItem('delivery_crudcrud_url');
-        const freshUrl = await fetchActiveCloudUrl();
-        if (freshUrl) {
-          await fetch(freshUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(orderObj),
-          });
-        }
+  const broadcastP2P = useCallback((data) => {
+    peerConnectionsRef.current.forEach((conn) => {
+      if (conn && conn.open) {
+        try {
+          conn.send(data);
+        } catch (e) {}
       }
-    } catch (err) {
-      console.error('Cloud push order error:', err);
-    }
+    });
   }, []);
 
-  // --- Pull & Merge Cloud Orders (Polls every 3s + on window focus) ---
   useEffect(() => {
-    let isMounted = true;
-    let initialLoadDone = false;
+    let peer;
+    const isOperator = auth && auth.role === 'admin';
 
-    const pullFromCloud = async () => {
-      try {
-        let apiUrl = localStorage.getItem('delivery_crudcrud_url') || DEFAULT_CLOUD_URL;
-        let res = await fetch(apiUrl);
+    try {
+      if (isOperator) {
+        // Admin acts as PeerJS Host
+        peer = new Peer(HOST_PEER_ID, { debug: 0 });
 
-        if (!res.ok || res.status === 404) {
-          localStorage.removeItem('delivery_crudcrud_url');
-          const freshUrl = await fetchActiveCloudUrl();
-          if (freshUrl) {
-            res = await fetch(freshUrl);
-          }
-        }
+        peer.on('connection', (conn) => {
+          peerConnectionsRef.current.push(conn);
 
-        if (!res || !res.ok) return;
-        const text = await res.text();
-        let cloudOrdersRaw = [];
-        try {
-          cloudOrdersRaw = JSON.parse(text);
-        } catch (e) {
-          // If text is "Endpoint has expired" or non-JSON HTML, reset key safely
-          localStorage.removeItem('delivery_crudcrud_url');
-          fetchActiveCloudUrl();
-          return;
-        }
-
-        if (Array.isArray(cloudOrdersRaw) && isMounted) {
-          const cloudOrders = cloudOrdersRaw.map(sanitizeOrder).filter(Boolean);
-          const toastsToTrigger = [];
-
-          setOrders((currentOrders) => {
-            const map = new Map();
-
-            // Load existing local orders first
-            (currentOrders || []).forEach((o) => {
-              if (o && o.id) {
-                map.set(o.id, o);
-              }
+          conn.on('open', () => {
+            // Send full current state to newly connected viewer
+            conn.send({
+              type: 'INIT_STATE',
+              orders,
+              riders,
             });
-
-            let hasNewOrChanged = false;
-            cloudOrders.forEach((o) => {
-              if (!o || !o.id) return;
-              const existing = map.get(o.id);
-
-              if (!existing) {
-                map.set(o.id, o);
-                hasNewOrChanged = true;
-                if (initialLoadDone) {
-                  toastsToTrigger.push({
-                    title: 'New Order Created',
-                    message: `${o.orderLabel} (Driver: ${o.driver || 'Unassigned'})`,
-                    type: 'new_order',
-                  });
-                }
-              } else if (
-                o.status !== existing.status ||
-                o.deliveredAt !== existing.deliveredAt ||
-                o.isRemovedFromActive !== existing.isRemovedFromActive
-              ) {
-                map.set(o.id, { ...existing, ...o });
-                hasNewOrChanged = true;
-                if (initialLoadDone) {
-                  const statusFormatted = (o.status || '').replace('_', ' ').toUpperCase();
-                  toastsToTrigger.push({
-                    title: 'Order Status Updated',
-                    message: `${o.orderLabel} status changed to ${statusFormatted}`,
-                    type: o.status === 'delivered' ? 'success' : o.status === 'overdue' ? 'warning' : 'info',
-                  });
-                }
-              }
-            });
-
-            initialLoadDone = true;
-            if (!hasNewOrChanged) return currentOrders;
-
-            const merged = Array.from(map.values()).sort(
-              (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
-            );
-
-            localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(merged));
-            return merged;
           });
+        });
+      } else {
+        // Viewer connects to Admin Host
+        peer = new Peer({ debug: 0 });
 
-          // Trigger toasts outside setOrders callback safely
-          toastsToTrigger.forEach((t) => addToast(t));
-        }
-      } catch (err) {
-        // Silent fail on network glitches - never crashes!
+        peer.on('open', () => {
+          const conn = peer.connect(HOST_PEER_ID);
+
+          conn.on('data', (data) => {
+            if (!data || typeof data !== 'object') return;
+            if (data.type === 'INIT_STATE' || data.type === 'SYNC_ORDERS') {
+              if (Array.isArray(data.orders)) {
+                const sanitized = data.orders.map(sanitizeOrder).filter(Boolean);
+                setOrders(sanitized);
+                localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(sanitized));
+              }
+              if (Array.isArray(data.riders)) {
+                setRiders(data.riders);
+                localStorage.setItem(STORAGE_KEYS.RIDERS, JSON.stringify(data.riders));
+              }
+            }
+          });
+        });
       }
-    };
-
-    pullFromCloud();
-    const interval = setInterval(pullFromCloud, 3000);
-    const handleFocus = () => pullFromCloud();
-    window.addEventListener('focus', handleFocus);
+    } catch (e) {
+      console.error('PeerJS init notice:', e);
+    }
 
     return () => {
-      isMounted = false;
-      clearInterval(interval);
-      window.removeEventListener('focus', handleFocus);
+      if (peer) {
+        try {
+          peer.destroy();
+        } catch (e) {}
+      }
     };
-  }, [addToast]);
+  }, [auth]);
 
   // --- Broadcast Channel Setup for local tabs ---
   useEffect(() => {
@@ -303,7 +221,7 @@ export function DeliveryProvider({ children }) {
     };
   }, []);
 
-  const broadcastSync = (type, payload) => {
+  const broadcastSync = useCallback((type, payload) => {
     if (typeof BroadcastChannel !== 'undefined') {
       try {
         const channel = new BroadcastChannel('delivery_tracker_sync');
@@ -311,21 +229,23 @@ export function DeliveryProvider({ children }) {
         channel.close();
       } catch (e) {}
     }
-  };
+  }, []);
 
   // --- Update Local Orders & Broadcast ---
   const updateOrders = useCallback((newOrders) => {
     setOrders(newOrders);
     localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(newOrders));
     broadcastSync('SYNC_ORDERS', newOrders);
-  }, []);
+    broadcastP2P({ type: 'SYNC_ORDERS', orders: newOrders, riders });
+  }, [riders, broadcastSync, broadcastP2P]);
 
   // --- Update Local Riders & Broadcast ---
   const updateRiders = useCallback((newRiders) => {
     setRiders(newRiders);
     localStorage.setItem(STORAGE_KEYS.RIDERS, JSON.stringify(newRiders));
     broadcastSync('SYNC_RIDERS', newRiders);
-  }, []);
+    broadcastP2P({ type: 'SYNC_RIDERS', orders, riders: newRiders });
+  }, [orders, broadcastSync, broadcastP2P]);
 
   // --- Login / Logout ---
   const login = useCallback((username, password) => {
@@ -416,14 +336,13 @@ export function DeliveryProvider({ children }) {
 
     const updated = [newOrder, ...orders];
     updateOrders(updated);
-    syncOrderToCloud(newOrder);
     addToast({
       title: 'Order Started',
       message: `Started Order ${orderNumber} (Driver: ${driver || 'Unassigned'})`,
       type: 'new_order',
     });
     return newOrder;
-  }, [orders, updateOrders, syncOrderToCloud, addToast]);
+  }, [orders, updateOrders, addToast]);
 
   // --- Change Order Status ---
   const setOrderStatus = useCallback((orderId, newStatus) => {
@@ -472,7 +391,6 @@ export function DeliveryProvider({ children }) {
 
     updateOrders(updated);
     if (targetOrder) {
-      syncOrderToCloud(targetOrder);
       const statusFormatted = (newStatus || '').replace('_', ' ').toUpperCase();
       addToast({
         title: 'Status Updated',
@@ -480,7 +398,7 @@ export function DeliveryProvider({ children }) {
         type: newStatus === 'delivered' ? 'success' : newStatus === 'overdue' ? 'warning' : 'info',
       });
     }
-  }, [orders, updateOrders, syncOrderToCloud, addToast]);
+  }, [orders, updateOrders, addToast]);
 
   // --- Mark Delivered ---
   const markDelivered = useCallback((orderId) => {
@@ -499,14 +417,13 @@ export function DeliveryProvider({ children }) {
     }).filter(Boolean);
     updateOrders(updated);
     if (targetOrder) {
-      syncOrderToCloud(targetOrder);
       addToast({
         title: 'Order Removed',
         message: `${targetOrder.orderLabel} removed from active view`,
         type: 'danger',
       });
     }
-  }, [orders, updateOrders, syncOrderToCloud, addToast]);
+  }, [orders, updateOrders, addToast]);
 
   // --- Active Order Numbers locked/disabled ---
   const lockedOrderNumbers = useMemo(() => {
