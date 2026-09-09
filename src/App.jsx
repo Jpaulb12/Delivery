@@ -1,6 +1,7 @@
 import React from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { DeliveryProvider, useDelivery } from './context/DeliveryContext';
+import ErrorBoundary from './components/ErrorBoundary';
 import Login from './pages/Login';
 import OperatorView from './pages/OperatorView';
 import ViewerView from './pages/ViewerView';
@@ -33,30 +34,32 @@ function HomeRedirect() {
 
 export default function App() {
   return (
-    <DeliveryProvider>
-      <BrowserRouter>
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route
-            path="/operator"
-            element={
-              <ProtectedRoute requiredRole="admin">
-                <OperatorView />
-              </ProtectedRoute>
-            }
-          />
-          <Route
-            path="/viewer"
-            element={
-              <ProtectedRoute>
-                <ViewerView />
-              </ProtectedRoute>
-            }
-          />
-          <Route path="/" element={<HomeRedirect />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
-      </BrowserRouter>
-    </DeliveryProvider>
+    <ErrorBoundary>
+      <DeliveryProvider>
+        <BrowserRouter>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route
+              path="/operator"
+              element={
+                <ProtectedRoute requiredRole="admin">
+                  <OperatorView />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/viewer"
+              element={
+                <ProtectedRoute>
+                  <ViewerView />
+                </ProtectedRoute>
+              }
+            />
+            <Route path="/" element={<HomeRedirect />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </BrowserRouter>
+      </DeliveryProvider>
+    </ErrorBoundary>
   );
 }

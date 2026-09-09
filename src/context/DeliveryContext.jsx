@@ -106,6 +106,8 @@ export function DeliveryProvider({ children }) {
         const cloudOrders = await res.json();
 
         if (Array.isArray(cloudOrders) && isMounted) {
+          const toastsToTrigger = [];
+
           setOrders((currentOrders) => {
             const map = new Map();
 
@@ -127,7 +129,7 @@ export function DeliveryProvider({ children }) {
                 map.set(key, o);
                 hasNewOrChanged = true;
                 if (initialLoadDone) {
-                  addToast({
+                  toastsToTrigger.push({
                     title: 'New Order Created',
                     message: `${o.orderLabel} (Driver: ${o.driver || 'Unassigned'})`,
                     type: 'new_order',
@@ -141,7 +143,7 @@ export function DeliveryProvider({ children }) {
                 map.set(key, { ...existing, ...o });
                 hasNewOrChanged = true;
                 if (initialLoadDone) {
-                  addToast({
+                  toastsToTrigger.push({
                     title: 'Order Status Updated',
                     message: `${o.orderLabel} status changed to ${o.status.replace('_', ' ').toUpperCase()}`,
                     type: o.status === 'delivered' ? 'success' : o.status === 'overdue' ? 'warning' : 'info',
@@ -160,6 +162,9 @@ export function DeliveryProvider({ children }) {
             localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(merged));
             return merged;
           });
+
+          // Trigger toasts outside setOrders callback safely!
+          toastsToTrigger.forEach((t) => addToast(t));
         }
       } catch (err) {
         // Silent fail on network glitches
