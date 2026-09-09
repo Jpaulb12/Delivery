@@ -13,6 +13,26 @@ const CLOUD_API_URL = 'https://crudcrud.com/api/8589797782524f43a30d327b320bc4b0
 const DEFAULT_RIDERS = ['yowas', 'onesphore', 'paul', 'fred', 'uzziah', 'valens'];
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+// Helper to sanitize order objects against corrupt/partial JSON
+function sanitizeOrder(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const num = Number(raw.orderNumber) || 1;
+  return {
+    id: String(raw.id || 'ord_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4)),
+    orderNumber: num,
+    orderLabel: String(raw.orderLabel || `Order ${num}`),
+    driver: String(raw.driver || 'Unassigned'),
+    status: String(raw.status || 'in_transit'),
+    createdAt: String(raw.createdAt || new Date().toISOString()),
+    startedAt: String(raw.startedAt || raw.createdAt || new Date().toISOString()),
+    timerDurationSeconds: Number(raw.timerDurationSeconds) || 1800,
+    deliveredAt: raw.deliveredAt ? String(raw.deliveredAt) : null,
+    totalTimeTakenSeconds: raw.totalTimeTakenSeconds !== undefined ? Number(raw.totalTimeTakenSeconds) : null,
+    overdueBySeconds: raw.overdueBySeconds !== undefined ? Number(raw.overdueBySeconds) : null,
+    isRemovedFromActive: Boolean(raw.isRemovedFromActive),
+  };
+}
+
 export function DeliveryProvider({ children }) {
   // --- Auth State ---
   const [auth, setAuth] = useState(() => {
@@ -20,7 +40,7 @@ export function DeliveryProvider({ children }) {
       const saved = localStorage.getItem(STORAGE_KEYS.AUTH);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (parsed.loginTime && Date.now() - parsed.loginTime < SESSION_DURATION_MS) {
+        if (parsed && parsed.loginTime && Date.now() - parsed.loginTime < SESSION_DURATION_MS) {
           return parsed;
         }
       }
@@ -30,7 +50,7 @@ export function DeliveryProvider({ children }) {
     return { user: null, role: null, loginTime: null };
   });
 
-  // --- Date Range Filter State (Default to empty = Show All Orders everywhere by default) ---
+  // --- Date Range Filter State ---
   const [dateRange, setDateRange] = useState({
     startDate: '',
     endDate: '',
@@ -45,7 +65,7 @@ export function DeliveryProvider({ children }) {
 
   const addToast = useCallback(({ title, message, type = 'info' }) => {
     const toastId = 'toast_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
-    const newToast = { id: toastId, title, message, type, timestamp: Date.now() };
+    const newToast = { id: toastId, title: String(title || 'Notice'), message: String(message || ''), type, timestamp: Date.now() };
     setToastList((prev) => [newToast, ...prev].slice(0, 4));
 
     setTimeout(() => {
@@ -59,7 +79,7 @@ export function DeliveryProvider({ children }) {
       const saved = localStorage.getItem(STORAGE_KEYS.RIDERS);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed.map(String);
       }
     } catch (e) {
       console.error('Error loading riders', e);
@@ -73,7 +93,9 @@ export function DeliveryProvider({ children }) {
       const saved = localStorage.getItem(STORAGE_KEYS.ORDERS);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) return parsed;
+        if (Array.isArray(parsed)) {
+          return parsed.map(sanitizeOrder).filter(Boolean);
+        }
       }
     } catch (e) {
       console.error('Error loading orders', e);
@@ -83,6 +105,7 @@ export function DeliveryProvider({ children }) {
 
   // --- Push Single Order / Status to Cloud Database ---
   const syncOrderToCloud = useCallback(async (orderObj) => {
+    if (!orderObj) return;
     try {
       await fetch(CLOUD_API_URL, {
         method: 'POST',
@@ -94,7 +117,7 @@ export function DeliveryProvider({ children }) {
     }
   }, []);
 
-  // --- Pull & Merge Cloud Orders (Polls every 3s + on window focus) ---
+  // --- Pull & Merge Cloud Orders ---
   useEffect(() => {
     let isMounted = true;
     let initialLoadDone = false;
@@ -103,30 +126,29 @@ export function DeliveryProvider({ children }) {
       try {
         const res = await fetch(CLOUD_API_URL);
         if (!res.ok) return;
-        const cloudOrders = await res.json();
+        const cloudOrdersRaw = await res.json();
 
-        if (Array.isArray(cloudOrders) && isMounted) {
+        if (Array.isArray(cloudOrdersRaw) && isMounted) {
+          const cloudOrders = cloudOrdersRaw.map(sanitizeOrder).filter(Boolean);
           const toastsToTrigger = [];
 
           setOrders((currentOrders) => {
             const map = new Map();
 
             // Load existing local orders first
-            currentOrders.forEach((o) => {
-              if (o && (o.id || o.orderNumber)) {
-                map.set(o.id || String(o.orderNumber), o);
+            (currentOrders || []).forEach((o) => {
+              if (o && o.id) {
+                map.set(o.id, o);
               }
             });
 
             let hasNewOrChanged = false;
             cloudOrders.forEach((o) => {
-              if (!o) return;
-              const key = o.id || String(o.orderNumber);
-              if (!key) return;
-              const existing = map.get(key);
+              if (!o || !o.id) return;
+              const existing = map.get(o.id);
 
               if (!existing) {
-                map.set(key, o);
+                map.set(o.id, o);
                 hasNewOrChanged = true;
                 if (initialLoadDone) {
                   toastsToTrigger.push({
@@ -140,12 +162,13 @@ export function DeliveryProvider({ children }) {
                 o.deliveredAt !== existing.deliveredAt ||
                 o.isRemovedFromActive !== existing.isRemovedFromActive
               ) {
-                map.set(key, { ...existing, ...o });
+                map.set(o.id, { ...existing, ...o });
                 hasNewOrChanged = true;
                 if (initialLoadDone) {
+                  const statusFormatted = (o.status || '').replace('_', ' ').toUpperCase();
                   toastsToTrigger.push({
                     title: 'Order Status Updated',
-                    message: `${o.orderLabel} status changed to ${o.status.replace('_', ' ').toUpperCase()}`,
+                    message: `${o.orderLabel} status changed to ${statusFormatted}`,
                     type: o.status === 'delivered' ? 'success' : o.status === 'overdue' ? 'warning' : 'info',
                   });
                 }
@@ -163,7 +186,7 @@ export function DeliveryProvider({ children }) {
             return merged;
           });
 
-          // Trigger toasts outside setOrders callback safely!
+          // Trigger toasts outside setOrders callback safely
           toastsToTrigger.forEach((t) => addToast(t));
         }
       } catch (err) {
@@ -190,10 +213,10 @@ export function DeliveryProvider({ children }) {
       channel = new BroadcastChannel('delivery_tracker_sync');
       channel.onmessage = (event) => {
         const { type, payload } = event.data || {};
-        if (type === 'SYNC_ORDERS') {
-          setOrders(payload);
-        } else if (type === 'SYNC_RIDERS') {
-          setRiders(payload);
+        if (type === 'SYNC_ORDERS' && Array.isArray(payload)) {
+          setOrders(payload.map(sanitizeOrder).filter(Boolean));
+        } else if (type === 'SYNC_RIDERS' && Array.isArray(payload)) {
+          setRiders(payload.map(String));
         }
       };
     }
@@ -201,12 +224,18 @@ export function DeliveryProvider({ children }) {
     const handleStorageEvent = (e) => {
       if (e.key === STORAGE_KEYS.ORDERS && e.newValue) {
         try {
-          setOrders(JSON.parse(e.newValue));
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed)) {
+            setOrders(parsed.map(sanitizeOrder).filter(Boolean));
+          }
         } catch (err) {}
       }
       if (e.key === STORAGE_KEYS.RIDERS && e.newValue) {
         try {
-          setRiders(JSON.parse(e.newValue));
+          const parsed = JSON.parse(e.newValue);
+          if (Array.isArray(parsed)) {
+            setRiders(parsed.map(String));
+          }
         } catch (err) {}
       }
       if (e.key === STORAGE_KEYS.AUTH && e.newValue) {
@@ -284,6 +313,7 @@ export function DeliveryProvider({ children }) {
   useEffect(() => {
     let hasChanges = false;
     const updated = orders.map((order) => {
+      if (!order) return order;
       if (order.status === 'in_transit' && order.startedAt && order.timerDurationSeconds) {
         const started = new Date(order.startedAt).getTime();
         const expiresAt = started + order.timerDurationSeconds * 1000;
@@ -296,7 +326,7 @@ export function DeliveryProvider({ children }) {
         }
       }
       return order;
-    });
+    }).filter(Boolean);
 
     if (hasChanges) {
       updateOrders(updated);
@@ -305,9 +335,9 @@ export function DeliveryProvider({ children }) {
 
   // --- Add Rider ---
   const addRider = useCallback((name) => {
-    const trimmed = name.trim();
+    const trimmed = String(name || '').trim();
     if (!trimmed) return false;
-    if (riders.some((r) => r.toLowerCase() === trimmed.toLowerCase())) {
+    if (riders.some((r) => String(r).toLowerCase() === trimmed.toLowerCase())) {
       return true; // Already exists
     }
     const updated = [...riders, trimmed];
@@ -319,7 +349,7 @@ export function DeliveryProvider({ children }) {
   // --- Create Order ---
   const createOrder = useCallback(({ orderNumber, driver, timerDurationSeconds }) => {
     const nowIso = new Date().toISOString();
-    const newOrder = {
+    const newOrder = sanitizeOrder({
       id: 'ord_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4),
       orderNumber: Number(orderNumber),
       orderLabel: `Order ${orderNumber}`,
@@ -332,7 +362,7 @@ export function DeliveryProvider({ children }) {
       totalTimeTakenSeconds: null,
       overdueBySeconds: null,
       isRemovedFromActive: false,
-    };
+    });
 
     const updated = [newOrder, ...orders];
     updateOrders(updated);
@@ -352,7 +382,7 @@ export function DeliveryProvider({ children }) {
 
     let targetOrder = null;
     const updated = orders.map((order) => {
-      if (order.id !== orderId) return order;
+      if (!order || order.id !== orderId) return order;
 
       let deliveredAt = order.deliveredAt;
       let totalTimeTakenSeconds = order.totalTimeTakenSeconds;
@@ -382,20 +412,21 @@ export function DeliveryProvider({ children }) {
 
       targetOrder = {
         ...order,
-        status: newStatus,
+        status: String(newStatus),
         deliveredAt,
         totalTimeTakenSeconds,
         overdueBySeconds,
       };
       return targetOrder;
-    });
+    }).filter(Boolean);
 
     updateOrders(updated);
     if (targetOrder) {
       syncOrderToCloud(targetOrder);
+      const statusFormatted = (newStatus || '').replace('_', ' ').toUpperCase();
       addToast({
         title: 'Status Updated',
-        message: `${targetOrder.orderLabel} marked as ${newStatus.replace('_', ' ').toUpperCase()}`,
+        message: `${targetOrder.orderLabel} marked as ${statusFormatted}`,
         type: newStatus === 'delivered' ? 'success' : newStatus === 'overdue' ? 'warning' : 'info',
       });
     }
@@ -410,12 +441,12 @@ export function DeliveryProvider({ children }) {
   const removeOrder = useCallback((orderId) => {
     let targetOrder = null;
     const updated = orders.map((ord) => {
-      if (ord.id === orderId) {
+      if (ord && ord.id === orderId) {
         targetOrder = { ...ord, isRemovedFromActive: true };
         return targetOrder;
       }
       return ord;
-    });
+    }).filter(Boolean);
     updateOrders(updated);
     if (targetOrder) {
       syncOrderToCloud(targetOrder);
@@ -430,8 +461,8 @@ export function DeliveryProvider({ children }) {
   // --- Active Order Numbers locked/disabled ---
   const lockedOrderNumbers = useMemo(() => {
     const set = new Set();
-    orders.forEach((order) => {
-      if (!order.isRemovedFromActive && (order.status === 'in_transit' || order.status === 'overdue')) {
+    (orders || []).forEach((order) => {
+      if (order && !order.isRemovedFromActive && (order.status === 'in_transit' || order.status === 'overdue')) {
         set.add(Number(order.orderNumber));
       }
     });
@@ -441,8 +472,8 @@ export function DeliveryProvider({ children }) {
   // --- Filtered Orders by Calendar Date / Date Range ---
   const filteredOrders = useMemo(() => {
     if (!dateRange.startDate && !dateRange.endDate) return orders;
-    return orders.filter((order) =>
-      isTimestampInDateRange(order.createdAt, dateRange.startDate, dateRange.endDate)
+    return (orders || []).filter((order) =>
+      order && isTimestampInDateRange(order.createdAt, dateRange.startDate, dateRange.endDate)
     );
   }, [orders, dateRange]);
 
@@ -454,7 +485,8 @@ export function DeliveryProvider({ children }) {
     let totalOverdue = 0;
     let totalFailed = 0;
 
-    filteredOrders.forEach((order) => {
+    (filteredOrders || []).forEach((order) => {
+      if (!order) return;
       if (order.startedAt) totalOrders++;
 
       if (!order.isRemovedFromActive) {

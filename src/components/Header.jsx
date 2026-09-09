@@ -21,7 +21,7 @@ export default function Header() {
     navigate('/login');
   };
 
-  const isOperator = auth.role === 'admin';
+  const isOperator = Boolean(auth && auth.role === 'admin');
 
   return (
     <header className="bg-[#161922] border-b border-[#262a35] sticky top-0 z-40 shadow-lg">
