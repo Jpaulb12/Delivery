@@ -1,6 +1,5 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 import { isTimestampInDateRange } from '../utils/dateUtils';
-import { Peer } from 'peerjs';
 
 const DeliveryContext = createContext();
 
@@ -12,7 +11,6 @@ const STORAGE_KEYS = {
 
 const DEFAULT_RIDERS = ['yowas', 'onesphore', 'paul', 'fred', 'uzziah', 'valens'];
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
-const HOST_PEER_ID = 'delivery-tracker-admin-host-2026';
 
 // Helper to sanitize order objects against corrupt/partial JSON
 function sanitizeOrder(raw) {
@@ -28,8 +26,8 @@ function sanitizeOrder(raw) {
     startedAt: String(raw.startedAt || raw.createdAt || new Date().toISOString()),
     timerDurationSeconds: Number(raw.timerDurationSeconds) || 1800,
     deliveredAt: raw.deliveredAt ? String(raw.deliveredAt) : null,
-    totalTimeTakenSeconds: raw.totalTimeTakenSeconds !== undefined ? Number(raw.totalTimeTakenSeconds) : null,
-    overdueBySeconds: raw.overdueBySeconds !== undefined ? Number(raw.overdueBySeconds) : null,
+    totalTimeTakenSeconds: raw.totalTimeTakenSeconds !== undefined && raw.totalTimeTakenSeconds !== null ? Number(raw.totalTimeTakenSeconds) : null,
+    overdueBySeconds: raw.overdueBySeconds !== undefined && raw.overdueBySeconds !== null ? Number(raw.overdueBySeconds) : null,
     isRemovedFromActive: Boolean(raw.isRemovedFromActive),
   };
 }
@@ -104,89 +102,21 @@ export function DeliveryProvider({ children }) {
     return [];
   });
 
-  // --- PeerJS WebRTC P2P Connections ---
-  const peerConnectionsRef = useRef([]);
-
-  const broadcastP2P = useCallback((data) => {
-    peerConnectionsRef.current.forEach((conn) => {
-      if (conn && conn.open) {
-        try {
-          conn.send(data);
-        } catch (e) {}
-      }
-    });
-  }, []);
-
-  useEffect(() => {
-    let peer;
-    const isOperator = auth && auth.role === 'admin';
-
-    try {
-      if (isOperator) {
-        // Admin acts as PeerJS Host
-        peer = new Peer(HOST_PEER_ID, { debug: 0 });
-
-        peer.on('connection', (conn) => {
-          peerConnectionsRef.current.push(conn);
-
-          conn.on('open', () => {
-            // Send full current state to newly connected viewer
-            conn.send({
-              type: 'INIT_STATE',
-              orders,
-              riders,
-            });
-          });
-        });
-      } else {
-        // Viewer connects to Admin Host
-        peer = new Peer({ debug: 0 });
-
-        peer.on('open', () => {
-          const conn = peer.connect(HOST_PEER_ID);
-
-          conn.on('data', (data) => {
-            if (!data || typeof data !== 'object') return;
-            if (data.type === 'INIT_STATE' || data.type === 'SYNC_ORDERS') {
-              if (Array.isArray(data.orders)) {
-                const sanitized = data.orders.map(sanitizeOrder).filter(Boolean);
-                setOrders(sanitized);
-                localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(sanitized));
-              }
-              if (Array.isArray(data.riders)) {
-                setRiders(data.riders);
-                localStorage.setItem(STORAGE_KEYS.RIDERS, JSON.stringify(data.riders));
-              }
-            }
-          });
-        });
-      }
-    } catch (e) {
-      console.error('PeerJS init notice:', e);
-    }
-
-    return () => {
-      if (peer) {
-        try {
-          peer.destroy();
-        } catch (e) {}
-      }
-    };
-  }, [auth]);
-
   // --- Broadcast Channel Setup for local tabs ---
   useEffect(() => {
     let channel;
     if (typeof BroadcastChannel !== 'undefined') {
-      channel = new BroadcastChannel('delivery_tracker_sync');
-      channel.onmessage = (event) => {
-        const { type, payload } = event.data || {};
-        if (type === 'SYNC_ORDERS' && Array.isArray(payload)) {
-          setOrders(payload.map(sanitizeOrder).filter(Boolean));
-        } else if (type === 'SYNC_RIDERS' && Array.isArray(payload)) {
-          setRiders(payload.map(String));
-        }
-      };
+      try {
+        channel = new BroadcastChannel('delivery_tracker_sync');
+        channel.onmessage = (event) => {
+          const { type, payload } = event.data || {};
+          if (type === 'SYNC_ORDERS' && Array.isArray(payload)) {
+            setOrders(payload.map(sanitizeOrder).filter(Boolean));
+          } else if (type === 'SYNC_RIDERS' && Array.isArray(payload)) {
+            setRiders(payload.map(String));
+          }
+        };
+      } catch (e) {}
     }
 
     const handleStorageEvent = (e) => {
@@ -216,7 +146,11 @@ export function DeliveryProvider({ children }) {
     window.addEventListener('storage', handleStorageEvent);
 
     return () => {
-      if (channel) channel.close();
+      if (channel) {
+        try {
+          channel.close();
+        } catch (e) {}
+      }
       window.removeEventListener('storage', handleStorageEvent);
     };
   }, []);
@@ -234,31 +168,37 @@ export function DeliveryProvider({ children }) {
   // --- Update Local Orders & Broadcast ---
   const updateOrders = useCallback((newOrders) => {
     setOrders(newOrders);
-    localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(newOrders));
+    try {
+      localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(newOrders));
+    } catch (e) {}
     broadcastSync('SYNC_ORDERS', newOrders);
-    broadcastP2P({ type: 'SYNC_ORDERS', orders: newOrders, riders });
-  }, [riders, broadcastSync, broadcastP2P]);
+  }, [broadcastSync]);
 
   // --- Update Local Riders & Broadcast ---
   const updateRiders = useCallback((newRiders) => {
     setRiders(newRiders);
-    localStorage.setItem(STORAGE_KEYS.RIDERS, JSON.stringify(newRiders));
+    try {
+      localStorage.setItem(STORAGE_KEYS.RIDERS, JSON.stringify(newRiders));
+    } catch (e) {}
     broadcastSync('SYNC_RIDERS', newRiders);
-    broadcastP2P({ type: 'SYNC_RIDERS', orders, riders: newRiders });
-  }, [orders, broadcastSync, broadcastP2P]);
+  }, [broadcastSync]);
 
   // --- Login / Logout ---
   const login = useCallback((username, password) => {
     if (username === 'admin' && password === 'nihemart@2026') {
       const newAuth = { user: 'admin', role: 'admin', loginTime: Date.now() };
       setAuth(newAuth);
-      localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(newAuth));
+      try {
+        localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(newAuth));
+      } catch (e) {}
       return { success: true, role: 'admin' };
     }
     if (username === 'user' && password === 'nihemart@20266') {
       const newAuth = { user: 'user', role: 'viewer', loginTime: Date.now() };
       setAuth(newAuth);
-      localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(newAuth));
+      try {
+        localStorage.setItem(STORAGE_KEYS.AUTH, JSON.stringify(newAuth));
+      } catch (e) {}
       return { success: true, role: 'viewer' };
     }
     return { success: false, error: 'Invalid username or password' };
@@ -267,7 +207,9 @@ export function DeliveryProvider({ children }) {
   const logout = useCallback(() => {
     const newAuth = { user: null, role: null, loginTime: null };
     setAuth(newAuth);
-    localStorage.removeItem(STORAGE_KEYS.AUTH);
+    try {
+      localStorage.removeItem(STORAGE_KEYS.AUTH);
+    } catch (e) {}
   }, []);
 
   // --- Timer Ticking & Live Overdue Detection ---
@@ -282,7 +224,7 @@ export function DeliveryProvider({ children }) {
   // Automatically update status to 'overdue' if timer expired while in transit
   useEffect(() => {
     let hasChanges = false;
-    const updated = orders.map((order) => {
+    const updated = (orders || []).map((order) => {
       if (!order) return order;
       if (order.status === 'in_transit' && order.startedAt && order.timerDurationSeconds) {
         const started = new Date(order.startedAt).getTime();
@@ -314,7 +256,7 @@ export function DeliveryProvider({ children }) {
     updateRiders(updated);
     addToast({ title: 'New Rider Added', message: `Driver "${trimmed}" added to roster`, type: 'info' });
     return true;
-  }, [riders, updateRiders, addRider]);
+  }, [riders, updateRiders, addToast]);
 
   // --- Create Order ---
   const createOrder = useCallback(({ orderNumber, driver, timerDurationSeconds }) => {
@@ -350,7 +292,7 @@ export function DeliveryProvider({ children }) {
     const nowTime = new Date(nowIso).getTime();
 
     let targetOrder = null;
-    const updated = orders.map((order) => {
+    const updated = (orders || []).map((order) => {
       if (!order || order.id !== orderId) return order;
 
       let deliveredAt = order.deliveredAt;
@@ -408,7 +350,7 @@ export function DeliveryProvider({ children }) {
   // --- Soft Remove Order from Active List ---
   const removeOrder = useCallback((orderId) => {
     let targetOrder = null;
-    const updated = orders.map((ord) => {
+    const updated = (orders || []).map((ord) => {
       if (ord && ord.id === orderId) {
         targetOrder = { ...ord, isRemovedFromActive: true };
         return targetOrder;
