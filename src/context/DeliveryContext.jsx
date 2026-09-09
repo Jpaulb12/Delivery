@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 import { isTimestampInDateRange } from '../utils/dateUtils';
 
 const DeliveryContext = createContext();
@@ -9,7 +9,7 @@ const STORAGE_KEYS = {
   AUTH: 'delivery_tracker_auth_v2',
 };
 
-const CLOUD_SYNC_URL = 'https://api.restful-api.dev/objects/ff808181a067127101a0863faf0957da';
+const CLOUD_API_URL = 'https://crudcrud.com/api/8589797782524f43a30d327b320bc4b0/orders';
 const DEFAULT_RIDERS = ['yowas', 'onesphore', 'paul', 'fred', 'uzziah', 'valens'];
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -64,80 +64,84 @@ export function DeliveryProvider({ children }) {
     return [];
   });
 
-  // Ref tracking last JSON string to prevent redundant network loops
-  const ordersJsonRef = useRef(JSON.stringify(orders));
-  const ridersJsonRef = useRef(JSON.stringify(riders));
-
-  useEffect(() => {
-    ordersJsonRef.current = JSON.stringify(orders);
-  }, [orders]);
-
-  useEffect(() => {
-    ridersJsonRef.current = JSON.stringify(riders);
-  }, [riders]);
-
-  // --- Push changes to Cloud Database ---
-  const syncToCloud = useCallback(async (newOrders, newRiders) => {
+  // --- Push Single Order / Status to Cloud Database ---
+  const syncOrderToCloud = useCallback(async (orderObj) => {
     try {
-      await fetch(CLOUD_SYNC_URL, {
-        method: 'PUT',
+      await fetch(CLOUD_API_URL, {
+        method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: 'DeliveryTrackerGlobalState_v1',
-          data: {
-            orders: newOrders,
-            riders: newRiders,
-            lastUpdated: Date.now(),
-          },
-        }),
+        body: JSON.stringify(orderObj),
       });
     } catch (err) {
-      console.error('Cloud push sync error:', err);
+      console.error('Cloud push order error:', err);
     }
   }, []);
 
-  // --- Pull changes from Cloud Database (Polling every 2s for live cross-device sync) ---
+  // --- Pull & Merge Cloud Orders (Polls every 3s + on window focus) ---
   useEffect(() => {
     let isMounted = true;
 
     const pullFromCloud = async () => {
       try {
-        const res = await fetch(CLOUD_SYNC_URL);
+        const res = await fetch(CLOUD_API_URL);
         if (!res.ok) return;
-        const result = await res.json();
-        const cloudData = result?.data;
+        const cloudOrders = await res.json();
 
-        if (cloudData && isMounted) {
-          // Sync & Merge Orders if cloud has newer data
-          if (Array.isArray(cloudData.orders)) {
-            const cloudOrdersStr = JSON.stringify(cloudData.orders);
-            if (cloudOrdersStr !== ordersJsonRef.current) {
-              setOrders(cloudData.orders);
-              localStorage.setItem(STORAGE_KEYS.ORDERS, cloudOrdersStr);
-              ordersJsonRef.current = cloudOrdersStr;
-            }
-          }
-          // Sync Riders if cloud has newer data
-          if (Array.isArray(cloudData.riders) && cloudData.riders.length > 0) {
-            const cloudRidersStr = JSON.stringify(cloudData.riders);
-            if (cloudRidersStr !== ridersJsonRef.current) {
-              setRiders(cloudData.riders);
-              localStorage.setItem(STORAGE_KEYS.RIDERS, cloudRidersStr);
-              ridersJsonRef.current = cloudRidersStr;
-            }
-          }
+        if (Array.isArray(cloudOrders) && isMounted) {
+          setOrders((currentOrders) => {
+            const map = new Map();
+
+            // Load existing local orders first
+            currentOrders.forEach((o) => {
+              if (o && (o.id || o.orderNumber)) {
+                map.set(o.id || String(o.orderNumber), o);
+              }
+            });
+
+            let hasNewOrChanged = false;
+            cloudOrders.forEach((o) => {
+              if (!o) return;
+              const key = o.id || String(o.orderNumber);
+              if (!key) return;
+              const existing = map.get(key);
+
+              if (!existing) {
+                map.set(key, o);
+                hasNewOrChanged = true;
+              } else if (
+                o.status !== existing.status ||
+                o.deliveredAt !== existing.deliveredAt ||
+                o.isRemovedFromActive !== existing.isRemovedFromActive
+              ) {
+                map.set(key, { ...existing, ...o });
+                hasNewOrChanged = true;
+              }
+            });
+
+            if (!hasNewOrChanged) return currentOrders;
+
+            const merged = Array.from(map.values()).sort(
+              (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+            );
+
+            localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(merged));
+            return merged;
+          });
         }
       } catch (err) {
-        // Silent fail on network intermittent issues
+        // Silent fail on network glitches
       }
     };
 
     pullFromCloud();
-    const interval = setInterval(pullFromCloud, 2000);
+    const interval = setInterval(pullFromCloud, 3000);
+    const handleFocus = () => pullFromCloud();
+    window.addEventListener('focus', handleFocus);
 
     return () => {
       isMounted = false;
       clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
     };
   }, []);
 
@@ -192,21 +196,19 @@ export function DeliveryProvider({ children }) {
     }
   };
 
-  // --- Persist Orders & Push Cloud Sync ---
+  // --- Update Local Orders & Broadcast ---
   const updateOrders = useCallback((newOrders) => {
     setOrders(newOrders);
     localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(newOrders));
     broadcastSync('SYNC_ORDERS', newOrders);
-    syncToCloud(newOrders, riders);
-  }, [riders, syncToCloud]);
+  }, []);
 
-  // --- Persist Riders & Push Cloud Sync ---
+  // --- Update Local Riders & Broadcast ---
   const updateRiders = useCallback((newRiders) => {
     setRiders(newRiders);
     localStorage.setItem(STORAGE_KEYS.RIDERS, JSON.stringify(newRiders));
     broadcastSync('SYNC_RIDERS', newRiders);
-    syncToCloud(orders, newRiders);
-  }, [orders, syncToCloud]);
+  }, []);
 
   // --- Login / Logout ---
   const login = useCallback((username, password) => {
@@ -295,14 +297,16 @@ export function DeliveryProvider({ children }) {
 
     const updated = [newOrder, ...orders];
     updateOrders(updated);
+    syncOrderToCloud(newOrder);
     return newOrder;
-  }, [orders, updateOrders]);
+  }, [orders, updateOrders, syncOrderToCloud]);
 
   // --- Change Order Status ---
   const setOrderStatus = useCallback((orderId, newStatus) => {
     const nowIso = new Date().toISOString();
     const nowTime = new Date(nowIso).getTime();
 
+    let targetOrder = null;
     const updated = orders.map((order) => {
       if (order.id !== orderId) return order;
 
@@ -332,17 +336,19 @@ export function DeliveryProvider({ children }) {
         deliveredAt = null;
       }
 
-      return {
+      targetOrder = {
         ...order,
         status: newStatus,
         deliveredAt,
         totalTimeTakenSeconds,
         overdueBySeconds,
       };
+      return targetOrder;
     });
 
     updateOrders(updated);
-  }, [orders, updateOrders]);
+    if (targetOrder) syncOrderToCloud(targetOrder);
+  }, [orders, updateOrders, syncOrderToCloud]);
 
   // --- Mark Delivered ---
   const markDelivered = useCallback((orderId) => {
@@ -351,14 +357,17 @@ export function DeliveryProvider({ children }) {
 
   // --- Soft Remove Order from Active List ---
   const removeOrder = useCallback((orderId) => {
+    let targetOrder = null;
     const updated = orders.map((ord) => {
       if (ord.id === orderId) {
-        return { ...ord, isRemovedFromActive: true };
+        targetOrder = { ...ord, isRemovedFromActive: true };
+        return targetOrder;
       }
       return ord;
     });
     updateOrders(updated);
-  }, [orders, updateOrders]);
+    if (targetOrder) syncOrderToCloud(targetOrder);
+  }, [orders, updateOrders, syncOrderToCloud]);
 
   // --- Active Order Numbers locked/disabled ---
   const lockedOrderNumbers = useMemo(() => {
