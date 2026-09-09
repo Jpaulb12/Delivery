@@ -9,9 +9,27 @@ const STORAGE_KEYS = {
   AUTH: 'delivery_tracker_auth_v2',
 };
 
-const CLOUD_API_URL = 'https://crudcrud.com/api/8589797782524f43a30d327b320bc4b0/orders';
+const DEFAULT_CLOUD_URL = 'https://crudcrud.com/api/9beef4ec13c24a76811b1bcfa1a64245/orders';
 const DEFAULT_RIDERS = ['yowas', 'onesphore', 'paul', 'fred', 'uzziah', 'valens'];
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Self-healing Cloud Endpoint URL Generator
+async function fetchActiveCloudUrl() {
+  try {
+    const saved = localStorage.getItem('delivery_crudcrud_url');
+    if (saved) return saved;
+
+    const res = await fetch('https://crudcrud.com');
+    const html = await res.text();
+    const match = html.match(/https:\/\/crudcrud\.com\/api\/[a-f0-9]{32}/);
+    if (match) {
+      const freshUrl = `${match[0]}/orders`;
+      localStorage.setItem('delivery_crudcrud_url', freshUrl);
+      return freshUrl;
+    }
+  } catch (err) {}
+  return DEFAULT_CLOUD_URL;
+}
 
 // Helper to sanitize order objects against corrupt/partial JSON
 function sanitizeOrder(raw) {
@@ -107,26 +125,58 @@ export function DeliveryProvider({ children }) {
   const syncOrderToCloud = useCallback(async (orderObj) => {
     if (!orderObj) return;
     try {
-      await fetch(CLOUD_API_URL, {
+      let apiUrl = localStorage.getItem('delivery_crudcrud_url') || DEFAULT_CLOUD_URL;
+      let res = await fetch(apiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(orderObj),
       });
+
+      if (!res.ok) {
+        localStorage.removeItem('delivery_crudcrud_url');
+        const freshUrl = await fetchActiveCloudUrl();
+        if (freshUrl) {
+          await fetch(freshUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(orderObj),
+          });
+        }
+      }
     } catch (err) {
       console.error('Cloud push order error:', err);
     }
   }, []);
 
-  // --- Pull & Merge Cloud Orders ---
+  // --- Pull & Merge Cloud Orders (Polls every 3s + on window focus) ---
   useEffect(() => {
     let isMounted = true;
     let initialLoadDone = false;
 
     const pullFromCloud = async () => {
       try {
-        const res = await fetch(CLOUD_API_URL);
-        if (!res.ok) return;
-        const cloudOrdersRaw = await res.json();
+        let apiUrl = localStorage.getItem('delivery_crudcrud_url') || DEFAULT_CLOUD_URL;
+        let res = await fetch(apiUrl);
+
+        if (!res.ok || res.status === 404) {
+          localStorage.removeItem('delivery_crudcrud_url');
+          const freshUrl = await fetchActiveCloudUrl();
+          if (freshUrl) {
+            res = await fetch(freshUrl);
+          }
+        }
+
+        if (!res || !res.ok) return;
+        const text = await res.text();
+        let cloudOrdersRaw = [];
+        try {
+          cloudOrdersRaw = JSON.parse(text);
+        } catch (e) {
+          // If text is "Endpoint has expired" or non-JSON HTML, reset key safely
+          localStorage.removeItem('delivery_crudcrud_url');
+          fetchActiveCloudUrl();
+          return;
+        }
 
         if (Array.isArray(cloudOrdersRaw) && isMounted) {
           const cloudOrders = cloudOrdersRaw.map(sanitizeOrder).filter(Boolean);
@@ -190,7 +240,7 @@ export function DeliveryProvider({ children }) {
           toastsToTrigger.forEach((t) => addToast(t));
         }
       } catch (err) {
-        // Silent fail on network glitches
+        // Silent fail on network glitches - never crashes!
       }
     };
 
