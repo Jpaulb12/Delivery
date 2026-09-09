@@ -36,6 +36,23 @@ export function DeliveryProvider({ children }) {
     endDate: '',
   });
 
+  // --- Live Toast Notifications State ---
+  const [toastList, setToastList] = useState([]);
+
+  const removeToast = useCallback((id) => {
+    setToastList((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  const addToast = useCallback(({ title, message, type = 'info' }) => {
+    const toastId = 'toast_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);
+    const newToast = { id: toastId, title, message, type, timestamp: Date.now() };
+    setToastList((prev) => [newToast, ...prev].slice(0, 4));
+
+    setTimeout(() => {
+      removeToast(toastId);
+    }, 6000);
+  }, [removeToast]);
+
   // --- Riders State ---
   const [riders, setRiders] = useState(() => {
     try {
@@ -80,6 +97,7 @@ export function DeliveryProvider({ children }) {
   // --- Pull & Merge Cloud Orders (Polls every 3s + on window focus) ---
   useEffect(() => {
     let isMounted = true;
+    let initialLoadDone = false;
 
     const pullFromCloud = async () => {
       try {
@@ -108,6 +126,13 @@ export function DeliveryProvider({ children }) {
               if (!existing) {
                 map.set(key, o);
                 hasNewOrChanged = true;
+                if (initialLoadDone) {
+                  addToast({
+                    title: 'New Order Created',
+                    message: `${o.orderLabel} (Driver: ${o.driver || 'Unassigned'})`,
+                    type: 'new_order',
+                  });
+                }
               } else if (
                 o.status !== existing.status ||
                 o.deliveredAt !== existing.deliveredAt ||
@@ -115,9 +140,17 @@ export function DeliveryProvider({ children }) {
               ) {
                 map.set(key, { ...existing, ...o });
                 hasNewOrChanged = true;
+                if (initialLoadDone) {
+                  addToast({
+                    title: 'Order Status Updated',
+                    message: `${o.orderLabel} status changed to ${o.status.replace('_', ' ').toUpperCase()}`,
+                    type: o.status === 'delivered' ? 'success' : o.status === 'overdue' ? 'warning' : 'info',
+                  });
+                }
               }
             });
 
+            initialLoadDone = true;
             if (!hasNewOrChanged) return currentOrders;
 
             const merged = Array.from(map.values()).sort(
@@ -143,7 +176,7 @@ export function DeliveryProvider({ children }) {
       clearInterval(interval);
       window.removeEventListener('focus', handleFocus);
     };
-  }, []);
+  }, [addToast]);
 
   // --- Broadcast Channel Setup for local tabs ---
   useEffect(() => {
@@ -274,8 +307,9 @@ export function DeliveryProvider({ children }) {
     }
     const updated = [...riders, trimmed];
     updateRiders(updated);
+    addToast({ title: 'New Rider Added', message: `Driver "${trimmed}" added to roster`, type: 'info' });
     return true;
-  }, [riders, updateRiders]);
+  }, [riders, updateRiders, addRider]);
 
   // --- Create Order ---
   const createOrder = useCallback(({ orderNumber, driver, timerDurationSeconds }) => {
@@ -298,8 +332,13 @@ export function DeliveryProvider({ children }) {
     const updated = [newOrder, ...orders];
     updateOrders(updated);
     syncOrderToCloud(newOrder);
+    addToast({
+      title: 'Order Started',
+      message: `Started Order ${orderNumber} (Driver: ${driver || 'Unassigned'})`,
+      type: 'new_order',
+    });
     return newOrder;
-  }, [orders, updateOrders, syncOrderToCloud]);
+  }, [orders, updateOrders, syncOrderToCloud, addToast]);
 
   // --- Change Order Status ---
   const setOrderStatus = useCallback((orderId, newStatus) => {
@@ -347,8 +386,15 @@ export function DeliveryProvider({ children }) {
     });
 
     updateOrders(updated);
-    if (targetOrder) syncOrderToCloud(targetOrder);
-  }, [orders, updateOrders, syncOrderToCloud]);
+    if (targetOrder) {
+      syncOrderToCloud(targetOrder);
+      addToast({
+        title: 'Status Updated',
+        message: `${targetOrder.orderLabel} marked as ${newStatus.replace('_', ' ').toUpperCase()}`,
+        type: newStatus === 'delivered' ? 'success' : newStatus === 'overdue' ? 'warning' : 'info',
+      });
+    }
+  }, [orders, updateOrders, syncOrderToCloud, addToast]);
 
   // --- Mark Delivered ---
   const markDelivered = useCallback((orderId) => {
@@ -366,8 +412,15 @@ export function DeliveryProvider({ children }) {
       return ord;
     });
     updateOrders(updated);
-    if (targetOrder) syncOrderToCloud(targetOrder);
-  }, [orders, updateOrders, syncOrderToCloud]);
+    if (targetOrder) {
+      syncOrderToCloud(targetOrder);
+      addToast({
+        title: 'Order Removed',
+        message: `${targetOrder.orderLabel} removed from active view`,
+        type: 'danger',
+      });
+    }
+  }, [orders, updateOrders, syncOrderToCloud, addToast]);
 
   // --- Active Order Numbers locked/disabled ---
   const lockedOrderNumbers = useMemo(() => {
@@ -437,6 +490,9 @@ export function DeliveryProvider({ children }) {
     setOrderStatus,
     markDelivered,
     removeOrder,
+    toastList,
+    addToast,
+    removeToast,
   };
 
   return <DeliveryContext.Provider value={value}>{children}</DeliveryContext.Provider>;
