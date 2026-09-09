@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { getTodayString, isTimestampInDateRange } from '../utils/dateUtils';
 
 const DeliveryContext = createContext();
@@ -9,6 +9,7 @@ const STORAGE_KEYS = {
   AUTH: 'delivery_tracker_auth_v2',
 };
 
+const CLOUD_SYNC_URL = 'https://api.restful-api.dev/objects/ff808181a067127101a0863faf0957da';
 const DEFAULT_RIDERS = ['yowas', 'onesphore', 'paul', 'fred', 'uzziah', 'valens'];
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -64,7 +65,84 @@ export function DeliveryProvider({ children }) {
     return [];
   });
 
-  // --- Broadcast Channel Setup ---
+  // Ref tracking last JSON string to prevent redundant network loops
+  const ordersJsonRef = useRef(JSON.stringify(orders));
+  const ridersJsonRef = useRef(JSON.stringify(riders));
+
+  useEffect(() => {
+    ordersJsonRef.current = JSON.stringify(orders);
+  }, [orders]);
+
+  useEffect(() => {
+    ridersJsonRef.current = JSON.stringify(riders);
+  }, [riders]);
+
+  // --- Push changes to Cloud Database ---
+  const syncToCloud = useCallback(async (newOrders, newRiders) => {
+    try {
+      await fetch(CLOUD_SYNC_URL, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'DeliveryTrackerGlobalState_v1',
+          data: {
+            orders: newOrders,
+            riders: newRiders,
+            lastUpdated: Date.now(),
+          },
+        }),
+      });
+    } catch (err) {
+      console.error('Cloud push sync error:', err);
+    }
+  }, []);
+
+  // --- Pull changes from Cloud Database (Polling every 2s for live cross-device sync) ---
+  useEffect(() => {
+    let isMounted = true;
+
+    const pullFromCloud = async () => {
+      try {
+        const res = await fetch(CLOUD_SYNC_URL);
+        if (!res.ok) return;
+        const result = await res.json();
+        const cloudData = result?.data;
+
+        if (cloudData && isMounted) {
+          // Sync Orders if cloud has newer data
+          if (Array.isArray(cloudData.orders)) {
+            const cloudOrdersStr = JSON.stringify(cloudData.orders);
+            if (cloudOrdersStr !== ordersJsonRef.current) {
+              setOrders(cloudData.orders);
+              localStorage.setItem(STORAGE_KEYS.ORDERS, cloudOrdersStr);
+              ordersJsonRef.current = cloudOrdersStr;
+            }
+          }
+          // Sync Riders if cloud has newer data
+          if (Array.isArray(cloudData.riders) && cloudData.riders.length > 0) {
+            const cloudRidersStr = JSON.stringify(cloudData.riders);
+            if (cloudRidersStr !== ridersJsonRef.current) {
+              setRiders(cloudData.riders);
+              localStorage.setItem(STORAGE_KEYS.RIDERS, cloudRidersStr);
+              ridersJsonRef.current = cloudRidersStr;
+            }
+          }
+        }
+      } catch (err) {
+        // Silent fail on network intermittent issues
+      }
+    };
+
+    pullFromCloud();
+    const interval = setInterval(pullFromCloud, 2500);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+    };
+  }, []);
+
+  // --- Broadcast Channel Setup for local tabs ---
   useEffect(() => {
     let channel;
     if (typeof BroadcastChannel !== 'undefined') {
@@ -105,7 +183,6 @@ export function DeliveryProvider({ children }) {
     };
   }, []);
 
-  // Broadcast helper
   const broadcastSync = (type, payload) => {
     if (typeof BroadcastChannel !== 'undefined') {
       try {
@@ -116,19 +193,21 @@ export function DeliveryProvider({ children }) {
     }
   };
 
-  // --- Persist Orders ---
+  // --- Persist Orders & Push Cloud Sync ---
   const updateOrders = useCallback((newOrders) => {
     setOrders(newOrders);
     localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(newOrders));
     broadcastSync('SYNC_ORDERS', newOrders);
-  }, []);
+    syncToCloud(newOrders, riders);
+  }, [riders, syncToCloud]);
 
-  // --- Persist Riders ---
+  // --- Persist Riders & Push Cloud Sync ---
   const updateRiders = useCallback((newRiders) => {
     setRiders(newRiders);
     localStorage.setItem(STORAGE_KEYS.RIDERS, JSON.stringify(newRiders));
     broadcastSync('SYNC_RIDERS', newRiders);
-  }, []);
+    syncToCloud(orders, newRiders);
+  }, [orders, syncToCloud]);
 
   // --- Login / Logout ---
   const login = useCallback((username, password) => {
