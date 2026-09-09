@@ -4,10 +4,10 @@ import { formatDuration } from '../utils/dateUtils';
 import { Truck, CheckCircle, Clock, AlertTriangle, User } from 'lucide-react';
 
 export default function InTransitCard({ isOperator = true }) {
-  const { filteredOrders, now, setOrderStatus, markDelivered } = useDelivery();
+  const { orders, now, setOrderStatus, markDelivered } = useDelivery();
 
-  // Get orders that are currently active: status is 'in_transit' or 'overdue' and not soft removed
-  const activeOrders = filteredOrders.filter(
+  // Get ALL active orders currently in transit or overdue from master list, ignoring calendar date filters
+  const activeOrders = orders.filter(
     (o) => !o.isRemovedFromActive && (o.status === 'in_transit' || o.status === 'overdue')
   );
 

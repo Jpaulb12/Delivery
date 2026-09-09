@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { getTodayString, isTimestampInDateRange } from '../utils/dateUtils';
+import { isTimestampInDateRange } from '../utils/dateUtils';
 
 const DeliveryContext = createContext();
 
@@ -30,11 +30,10 @@ export function DeliveryProvider({ children }) {
     return { user: null, role: null, loginTime: null };
   });
 
-  // --- Date Range Filter State ---
-  const today = getTodayString();
+  // --- Date Range Filter State (Default to empty = Show All Orders everywhere by default) ---
   const [dateRange, setDateRange] = useState({
-    startDate: today,
-    endDate: today,
+    startDate: '',
+    endDate: '',
   });
 
   // --- Riders State ---
@@ -109,7 +108,7 @@ export function DeliveryProvider({ children }) {
         const cloudData = result?.data;
 
         if (cloudData && isMounted) {
-          // Sync Orders if cloud has newer data
+          // Sync & Merge Orders if cloud has newer data
           if (Array.isArray(cloudData.orders)) {
             const cloudOrdersStr = JSON.stringify(cloudData.orders);
             if (cloudOrdersStr !== ordersJsonRef.current) {
@@ -134,7 +133,7 @@ export function DeliveryProvider({ children }) {
     };
 
     pullFromCloud();
-    const interval = setInterval(pullFromCloud, 2500);
+    const interval = setInterval(pullFromCloud, 2000);
 
     return () => {
       isMounted = false;
@@ -374,6 +373,7 @@ export function DeliveryProvider({ children }) {
 
   // --- Filtered Orders by Calendar Date / Date Range ---
   const filteredOrders = useMemo(() => {
+    if (!dateRange.startDate && !dateRange.endDate) return orders;
     return orders.filter((order) =>
       isTimestampInDateRange(order.createdAt, dateRange.startDate, dateRange.endDate)
     );
