@@ -9,6 +9,7 @@ const STORAGE_KEYS = {
   AUTH: 'delivery_tracker_auth_v2',
 };
 
+const CLOUD_API_URL = 'https://api.restful-api.dev/objects/ff808181a067127101a08c9aa9ca6a4a';
 const DEFAULT_RIDERS = ['yowas', 'onesphore', 'paul', 'fred', 'uzziah', 'valens'];
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -102,6 +103,144 @@ export function DeliveryProvider({ children }) {
     return [];
   });
 
+  // --- Push State to Global Cloud Database ---
+  const syncToCloud = useCallback(async (newOrders, newRiders) => {
+    try {
+      await fetch(CLOUD_API_URL, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: 'DeliveryTracker_Global_Live_Store_2026',
+          data: {
+            orders: newOrders,
+            riders: newRiders,
+            lastUpdated: Date.now(),
+          },
+        }),
+      });
+    } catch (err) {
+      // Silent fail on network glitches
+    }
+  }, []);
+
+  // --- Pull & Merge Cloud Orders (Polls every 5s + on window focus) ---
+  useEffect(() => {
+    let isMounted = true;
+    let initialLoadDone = false;
+
+    const pullFromCloud = async () => {
+      try {
+        const res = await fetch(CLOUD_API_URL);
+        if (!res.ok) return;
+        const text = await res.text();
+        if (!text || text.includes('<html')) return;
+
+        let cloudResult = null;
+        try {
+          cloudResult = JSON.parse(text);
+        } catch (e) {
+          return;
+        }
+
+        const cloudData = cloudResult?.data;
+        if (cloudData && isMounted) {
+          const cloudOrdersRaw = Array.isArray(cloudData.orders) ? cloudData.orders : [];
+          const cloudRidersRaw = Array.isArray(cloudData.riders) ? cloudData.riders : [];
+          const cloudOrders = cloudOrdersRaw.map(sanitizeOrder).filter(Boolean);
+          const toastsToTrigger = [];
+
+          // Sync Riders
+          if (cloudRidersRaw.length > 0) {
+            setRiders((prevRiders) => {
+              const prevStr = JSON.stringify(prevRiders);
+              const newStr = JSON.stringify(cloudRidersRaw);
+              if (prevStr !== newStr) {
+                try {
+                  localStorage.setItem(STORAGE_KEYS.RIDERS, newStr);
+                } catch (e) {}
+                return cloudRidersRaw;
+              }
+              return prevRiders;
+            });
+          }
+
+          // Sync Orders
+          setOrders((currentOrders) => {
+            const map = new Map();
+
+            // Load existing local orders first
+            (currentOrders || []).forEach((o) => {
+              if (o && o.id) {
+                map.set(o.id, o);
+              }
+            });
+
+            let hasNewOrChanged = false;
+            cloudOrders.forEach((o) => {
+              if (!o || !o.id) return;
+              const existing = map.get(o.id);
+
+              if (!existing) {
+                map.set(o.id, o);
+                hasNewOrChanged = true;
+                if (initialLoadDone) {
+                  toastsToTrigger.push({
+                    title: 'New Order Created',
+                    message: `${o.orderLabel} (Driver: ${o.driver || 'Unassigned'})`,
+                    type: 'new_order',
+                  });
+                }
+              } else if (
+                o.status !== existing.status ||
+                o.deliveredAt !== existing.deliveredAt ||
+                o.isRemovedFromActive !== existing.isRemovedFromActive
+              ) {
+                map.set(o.id, { ...existing, ...o });
+                hasNewOrChanged = true;
+                if (initialLoadDone) {
+                  const statusFormatted = (o.status || '').replace('_', ' ').toUpperCase();
+                  toastsToTrigger.push({
+                    title: 'Order Status Updated',
+                    message: `${o.orderLabel} status changed to ${statusFormatted}`,
+                    type: o.status === 'delivered' ? 'success' : o.status === 'overdue' ? 'warning' : 'info',
+                  });
+                }
+              }
+            });
+
+            initialLoadDone = true;
+            if (!hasNewOrChanged) return currentOrders;
+
+            const merged = Array.from(map.values()).sort(
+              (a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime()
+            );
+
+            try {
+              localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(merged));
+            } catch (e) {}
+            return merged;
+          });
+
+          // Trigger toasts outside setOrders callback safely
+          toastsToTrigger.forEach((t) => addToast(t));
+        }
+      } catch (err) {
+        // Silent fail on network glitches - never crashes!
+      }
+    };
+
+    pullFromCloud();
+    const interval = setInterval(pullFromCloud, 5000);
+    const handleFocus = () => pullFromCloud();
+    window.addEventListener('focus', handleFocus);
+
+    return () => {
+      isMounted = false;
+      clearInterval(interval);
+      window.removeEventListener('focus', handleFocus);
+    };
+  }, [addToast]);
+
   // --- Broadcast Channel Setup for local tabs ---
   useEffect(() => {
     let channel;
@@ -165,23 +304,25 @@ export function DeliveryProvider({ children }) {
     }
   }, []);
 
-  // --- Update Local Orders & Broadcast ---
+  // --- Update Local Orders, Broadcast & Cloud Sync ---
   const updateOrders = useCallback((newOrders) => {
     setOrders(newOrders);
     try {
       localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(newOrders));
     } catch (e) {}
     broadcastSync('SYNC_ORDERS', newOrders);
-  }, [broadcastSync]);
+    syncToCloud(newOrders, riders);
+  }, [riders, broadcastSync, syncToCloud]);
 
-  // --- Update Local Riders & Broadcast ---
+  // --- Update Local Riders, Broadcast & Cloud Sync ---
   const updateRiders = useCallback((newRiders) => {
     setRiders(newRiders);
     try {
       localStorage.setItem(STORAGE_KEYS.RIDERS, JSON.stringify(newRiders));
     } catch (e) {}
     broadcastSync('SYNC_RIDERS', newRiders);
-  }, [broadcastSync]);
+    syncToCloud(orders, newRiders);
+  }, [orders, broadcastSync, syncToCloud]);
 
   // --- Login / Logout ---
   const login = useCallback((username, password) => {
