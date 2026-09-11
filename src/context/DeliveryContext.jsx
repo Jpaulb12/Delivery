@@ -9,7 +9,8 @@ const STORAGE_KEYS = {
   AUTH: 'delivery_tracker_auth_v2',
 };
 
-const CLOUD_API_URL = 'https://api.restful-api.dev/objects/ff808181a067127101a08c9aa9ca6a4a';
+const PRIMARY_CLOUD_API_URL = '/api/sync';
+const FALLBACK_CLOUD_API_URL = 'https://api.restful-api.dev/objects/ff808181a067127101a08c9aa9ca6a4a';
 const DEFAULT_RIDERS = ['yowas', 'onesphore', 'paul', 'fred', 'uzziah', 'valens'];
 const SESSION_DURATION_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -105,44 +106,73 @@ export function DeliveryProvider({ children }) {
 
   // --- Push State to Global Cloud Database ---
   const syncToCloud = useCallback(async (newOrders, newRiders) => {
+    const payload = {
+      orders: newOrders,
+      riders: newRiders,
+      lastUpdated: Date.now(),
+    };
+
+    // 1. Primary sync to Netlify serverless endpoint
     try {
-      await fetch(CLOUD_API_URL, {
+      const res = await fetch(PRIMARY_CLOUD_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) return;
+    } catch (err) {
+      // Fallthrough to fallback endpoint
+    }
+
+    // 2. Secondary fallback
+    try {
+      await fetch(FALLBACK_CLOUD_API_URL, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: 'DeliveryTracker_Global_Live_Store_2026',
-          data: {
-            orders: newOrders,
-            riders: newRiders,
-            lastUpdated: Date.now(),
-          },
+          data: payload,
         }),
       });
     } catch (err) {
-      // Silent fail on network glitches
+      // Silent fail
     }
   }, []);
 
-  // --- Pull & Merge Cloud Orders (Polls every 5s + on window focus) ---
+  // --- Pull & Merge Cloud Orders (Adaptive polling + focus & visibility listeners) ---
   useEffect(() => {
     let isMounted = true;
     let initialLoadDone = false;
 
     const pullFromCloud = async () => {
       try {
-        const res = await fetch(CLOUD_API_URL);
-        if (!res.ok) return;
-        const text = await res.text();
-        if (!text || text.includes('<html')) return;
+        let cloudData = null;
 
-        let cloudResult = null;
+        // Try primary Netlify serverless function
         try {
-          cloudResult = JSON.parse(text);
-        } catch (e) {
-          return;
+          const res = await fetch(PRIMARY_CLOUD_API_URL, { cache: 'no-store' });
+          if (res.ok) {
+            const json = await res.json();
+            if (json && json.success && json.data) {
+              cloudData = json.data;
+            }
+          }
+        } catch (e) {}
+
+        // Fallback to secondary if primary gave no data
+        if (!cloudData) {
+          try {
+            const res = await fetch(FALLBACK_CLOUD_API_URL);
+            if (res.ok) {
+              const text = await res.text();
+              if (text && !text.includes('<html')) {
+                const cloudResult = JSON.parse(text);
+                cloudData = cloudResult?.data;
+              }
+            }
+          } catch (e) {}
         }
 
-        const cloudData = cloudResult?.data;
         if (cloudData && isMounted) {
           const cloudOrdersRaw = Array.isArray(cloudData.orders) ? cloudData.orders : [];
           const cloudRidersRaw = Array.isArray(cloudData.riders) ? cloudData.riders : [];
@@ -230,14 +260,29 @@ export function DeliveryProvider({ children }) {
     };
 
     pullFromCloud();
-    const interval = setInterval(pullFromCloud, 5000);
+
+    let pollInterval = setInterval(pullFromCloud, 4000);
+
+    const handleVisibilityChange = () => {
+      clearInterval(pollInterval);
+      if (document.hidden) {
+        pollInterval = setInterval(pullFromCloud, 12000);
+      } else {
+        pullFromCloud();
+        pollInterval = setInterval(pullFromCloud, 4000);
+      }
+    };
+
     const handleFocus = () => pullFromCloud();
+
     window.addEventListener('focus', handleFocus);
+    document.addEventListener('visibilitychange', handleVisibilityChange);
 
     return () => {
       isMounted = false;
-      clearInterval(interval);
+      clearInterval(pollInterval);
       window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, [addToast]);
 
